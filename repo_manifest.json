@@ -1,0 +1,20 @@
+{
+  "repository_name_suggestion": "kOA-Obama-Foundation-Briefing",
+  "description": "Independent briefing dossier presenting kOA's four-axis architecture: multilingual semantics, information surfacing, knowledge-to-action infrastructure, and propagation.",
+  "files": [
+    "CONTACT.md",
+    "NOTICE.md",
+    "README.fr.md",
+    "README.md",
+    "docs/01_EXECUTIVE_BRIEF.md",
+    "docs/02_THE_FOUR_AXES.md",
+    "docs/03_KNOWLEDGE_TO_ACTION_INFRASTRUCTURE.md",
+    "docs/04_DEMOCRATIC_CAPACITY.md",
+    "docs/05_EVIDENCE_MATURITY_LIMITS.md",
+    "docs/06_OBAMA_FOUNDATION_ALIGNMENT.md",
+    "docs/07_THREE_ALUMNI_DIALOGUES.md",
+    "docs/08_PUBLIC_REVIEW_PRECEDENTS.md",
+    "docs/09_SOURCE_MAP.md",
+    "docs/10_OFFICIAL_OBAMA_REFERENCES.md"
+  ]
+}
