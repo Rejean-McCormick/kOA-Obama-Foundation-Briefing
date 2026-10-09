@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ctypes
 import fnmatch
+import re
+from datetime import datetime
 import json
 import os
 import shutil
@@ -14,16 +16,16 @@ from typing import Any
 
 
 # -----------------------------------------------------------------------------
-# SmartSnap
+# ZmartZnap (optimized standalone Windows clipboard snapshot)
 # - No console (.pyw)
-# - Recursively snapshots this script's folder
+# - Recursively snapshots this script's folder in one directory pass
 # - ZIP compression: DEFLATE, level 2
 # - Exclusions aligned with Smart Dumper
-# - Places SmartSnap.zip on the Windows clipboard as a pasteable file
+# - Copies znapshot_<folder>_<MMDDHHmm>.zip to the Windows clipboard
 # - Leaves NO ZIP in the project folder
 # - Keeps only a temporary backing ZIP while the clipboard still references it
 # - Deletes the temporary ZIP when the clipboard changes
-# - SmartSnapKill.pyw can force-stop all active SmartSnap instances and cleanup
+# - Stale ZIP instances are cleaned up on the next run
 # - Shows OK / FAIL for ~0.5 second
 # -----------------------------------------------------------------------------
 
@@ -47,22 +49,44 @@ ALWAYS_IGNORE_FILES: set[str] = {
     "Entity", "Fact", "Modifier", "Predicate", "Property",
 }
 
-OUTPUT_NAME = "SmartSnap.zip"
 INDEX_NAME = "SNAPSHOT_INDEX.txt"
 USE_SMARTIGNORE_EXCLUDE = True
-STATE_DIR_NAME = "SmartSnapClipboard"
+STATE_DIR_NAME = "ZmartZnapClipboard"
 
 
 class IgnoreEngine:
-    """Standalone equivalent of Smart Dumper's ignore matching."""
+    """Fast, single-pass matcher retaining legacy ignore-rule syntax."""
 
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
-        self.rules: list[dict[str, Any]] = []
-        self.smartignore_patterns: list[str] = []
+        self.smartignore_patterns: list[tuple[re.Pattern[str], bool, bool, bool]] = []
+        if USE_SMARTIGNORE_EXCLUDE:
+            try:
+                lines = (self.root / ".smartignore").read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()
+            except OSError:
+                lines = []
+            for raw in lines:
+                pattern = raw.strip()
+                if not pattern or pattern.startswith("#"):
+                    continue
+                dir_only = pattern.endswith("/")
+                if dir_only:
+                    pattern = pattern[:-1].strip()
+                    if not pattern:
+                        continue
+                anchored = pattern.startswith("/")
+                if anchored:
+                    pattern = pattern[1:]
+                contains_slash = "/" in pattern
+                self.smartignore_patterns.append((
+                    re.compile(fnmatch.translate(os.path.normcase(pattern))),
+                    dir_only, anchored, contains_slash,
+                ))
 
     @staticmethod
-    def _parse_ignore_line(raw: str) -> dict[str, Any] | None:
+    def _parse_ignore_line(raw: str) -> tuple[str, bool, bool, bool] | None:
         line = raw.rstrip("\n").rstrip("\r")
         if not line:
             return None
@@ -72,237 +96,205 @@ class IgnoreEngine:
             line = line[:-1]
         if line.endswith("\\ "):
             line = line[:-2] + " "
-        if line.strip() == "":
+        if not line.strip():
             return None
-
         escaped_prefix = line.startswith("\\#") or line.startswith("\\!")
         if escaped_prefix:
             line = line[1:]
         if line.startswith("#") and not escaped_prefix:
             return None
-
         neg = False
         if line.startswith("!") and not escaped_prefix:
             neg = True
             line = line[1:]
-            if line == "":
+            if not line:
                 return None
-
         dir_only = line.endswith("/")
         if dir_only:
             line = line[:-1]
         anchored = line.startswith("/")
         if anchored:
             line = line[1:]
-        if line == "":
+        if not line:
             return None
+        return line, neg, dir_only, anchored
 
-        return {"pattern": line, "neg": neg, "dir_only": dir_only, "anchored": anchored}
-
-    def load(self) -> None:
-        visited: set[Path] = set()
-        for dirpath, dirnames, filenames in os.walk(self.root, followlinks=True):
-            current = Path(dirpath)
+    def local_rules(self, current: Path, relative_dir: str, names: set[str]) -> tuple:
+        """Load only ignore files in the current directory, once."""
+        local: list[tuple] = []
+        for ignore_name in (".gitignore", ".smartignore"):
+            if ignore_name not in names:
+                continue
             try:
-                current_real = current.resolve()
+                with (current / ignore_name).open(
+                    "r", encoding="utf-8-sig", errors="replace"
+                ) as stream:
+                    for line in stream:
+                        parsed = self._parse_ignore_line(line)
+                        if parsed is None:
+                            continue
+                        pattern, neg, dir_only, anchored = parsed
+                        local.append((
+                            re.compile(fnmatch.translate(os.path.normcase(pattern))),
+                            os.path.normcase(pattern), neg, dir_only,
+                            anchored or "/" in pattern, relative_dir,
+                        ))
             except OSError:
-                dirnames[:] = []
-                continue
-
-            if current_real in visited:
-                dirnames[:] = []
-                continue
-            visited.add(current_real)
-            try:
-                current_real.relative_to(self.root)
-            except ValueError:
-                dirnames[:] = []
-                continue
-
-            safe_dirs: list[str] = []
-            for name in dirnames:
-                if name in ALWAYS_IGNORE_DIRS:
-                    continue
-                p = current / name
-                try:
-                    resolved = p.resolve()
-                    resolved.relative_to(self.root)
-                except (OSError, ValueError):
-                    continue
-                safe_dirs.append(name)
-            dirnames[:] = safe_dirs
-
-            for ignore_name in (".gitignore", ".smartignore"):
-                if ignore_name not in filenames:
-                    continue
-                ignore_path = current / ignore_name
-                try:
-                    with ignore_path.open("r", encoding="utf-8-sig", errors="replace") as handle:
-                        for raw in handle:
-                            parsed = self._parse_ignore_line(raw)
-                            if parsed is not None:
-                                parsed["base"] = current_real
-                                self.rules.append(parsed)
-                except OSError:
-                    pass
-
-        smart_path = self.root / ".smartignore"
-        try:
-            for raw in smart_path.read_text(encoding="utf-8", errors="replace").splitlines():
-                line = raw.strip()
-                if line and not line.startswith("#"):
-                    self.smartignore_patterns.append(line)
-        except OSError:
-            pass
-
-    @staticmethod
-    def _match_rule(rule: dict[str, Any], path: Path, is_dir: bool) -> bool:
-        base: Path = rule["base"]
-        try:
-            rel_from_base = path.relative_to(base).as_posix()
-        except ValueError:
-            return False
-        name = path.name
-        pattern: str = rule["pattern"]
-
-        if rule["dir_only"]:
-            if not is_dir:
-                return False
-            if rule["anchored"] or "/" in pattern:
-                if fnmatch.fnmatch(rel_from_base, pattern):
-                    return True
-                return rel_from_base == pattern or rel_from_base.startswith(pattern + "/")
-            return fnmatch.fnmatch(name, pattern)
-
-        if rule["anchored"] or "/" in pattern:
-            return fnmatch.fnmatch(rel_from_base, pattern)
-        return fnmatch.fnmatch(name, pattern)
-
-    def gitignore_match(self, path: Path, *, is_dir: bool) -> bool:
-        path = path.resolve()
-        ignored = False
-        for rule in self.rules:
-            base: Path = rule["base"]
-            try:
-                path.relative_to(base)
-            except ValueError:
-                continue
-            if self._match_rule(rule, path, is_dir):
-                ignored = not rule["neg"]
-        return ignored
+                pass
+        return tuple(local)
 
     def smartignore_match(self, rel_posix: str, *, is_dir: bool) -> bool:
-        if not USE_SMARTIGNORE_EXCLUDE or not self.smartignore_patterns:
+        if not self.smartignore_patterns:
             return False
-
-        path = rel_posix
-        basename = path.rsplit("/", 1)[-1]
-        for raw_pattern in self.smartignore_patterns:
-            pattern = raw_pattern.strip()
-            if not pattern:
+        rel_posix = os.path.normcase(rel_posix)
+        basename = rel_posix.rsplit(os.sep if os.name == "nt" else "/", 1)[-1]
+        for compiled, dir_only, anchored, contains_slash in self.smartignore_patterns:
+            if dir_only and not is_dir:
                 continue
-            if pattern.endswith("/"):
-                pattern = pattern[:-1].strip()
-                if not pattern or not is_dir:
-                    continue
-            if pattern.startswith("/"):
-                if fnmatch.fnmatch(path, pattern[1:]):
+            if anchored:
+                if compiled.match(rel_posix):
                     return True
-                continue
-            if "/" not in pattern:
-                if fnmatch.fnmatch(basename, pattern):
+            elif not contains_slash:
+                if compiled.match(basename):
                     return True
-                continue
-            if fnmatch.fnmatch(path, pattern):
-                return True
-            parts = path.split("/")
-            for i in range(1, len(parts)):
-                if fnmatch.fnmatch("/".join(parts[i:]), pattern):
+            else:
+                if compiled.match(rel_posix):
                     return True
+                # Match a non-anchored pattern at any nested path boundary.
+                separator = os.sep if os.name == "nt" else "/"
+                start = 0
+                while True:
+                    found = rel_posix.find(separator, start)
+                    if found == -1:
+                        break
+                    if compiled.match(rel_posix[found + 1:]):
+                        return True
+                    start = found + 1
         return False
 
-    def dir_allowed(self, path: Path) -> bool:
+    def gitignore_match(self, rel_posix: str, *, is_dir: bool, rules: tuple) -> bool:
+        if not rules:
+            return False
+        ignored = False
+        name = os.path.normcase(rel_posix.rsplit("/", 1)[-1])
+        full = os.path.normcase(rel_posix)
+        for compiled, pattern, neg, dir_only, path_pattern, base_dir in rules:
+            if dir_only and not is_dir:
+                continue
+            if base_dir:
+                if rel_posix == base_dir:
+                    # A nested ignore file can unexpectedly exclude its own
+                    # directory in the legacy matcher. Preserve that behavior.
+                    rel_from_base = "."
+                elif rel_posix.startswith(base_dir + "/"):
+                    rel_from_base = os.path.normcase(rel_posix[len(base_dir) + 1:])
+                else:
+                    continue
+            else:
+                rel_from_base = full
+            matched = compiled.match(rel_from_base if path_pattern else name) is not None
+            if not matched and dir_only and path_pattern:
+                # Preserve legacy prefix matching for directory patterns.
+                matched = (rel_from_base == pattern or
+                           rel_from_base.startswith(pattern + os.sep))
+            if matched:
+                ignored = not neg
+        return ignored
+
+
+def collect_files(root: Path, engine: IgnoreEngine) -> list[tuple[Path, str]]:
+    """One scandir pass, pruning ignored directories and avoiding per-file resolve."""
+    root = root.resolve()
+    files: list[tuple[Path, str]] = []
+    visited_dirs: set[Path] = set()
+    visited_files: set[str] = set()
+    stack: list[tuple[Path, tuple]] = [(root, ())]
+
+    while stack:
+        current, inherited_rules = stack.pop()
         try:
-            resolved = path.resolve()
-            rel = resolved.relative_to(self.root).as_posix()
-        except (OSError, ValueError):
-            return False
-        if path.name in ALWAYS_IGNORE_DIRS:
-            return False
-        if self.smartignore_match(rel, is_dir=True):
-            return False
-        if self.gitignore_match(resolved, is_dir=True):
-            return False
-        return True
-
-    def file_allowed(self, path: Path) -> bool:
+            # Resolving directories, not every file, catches junctions and aliases.
+            current = current.resolve()
+            current.relative_to(root)
+        except (OSError, ValueError, RuntimeError):
+            continue
+        if current in visited_dirs:
+            continue
+        visited_dirs.add(current)
         try:
-            resolved = path.resolve()
-            rel_path = resolved.relative_to(self.root)
-        except (OSError, ValueError):
-            return False
-        if not resolved.is_file():
-            return False
-
-        for parent in resolved.parents:
-            if parent == self.root:
-                break
-            try:
-                rel_parent = parent.relative_to(self.root).as_posix()
-            except ValueError:
-                return False
-            if parent.name in ALWAYS_IGNORE_DIRS:
-                return False
-            if self.smartignore_match(rel_parent, is_dir=True):
-                return False
-            if self.gitignore_match(parent, is_dir=True):
-                return False
-
-        if resolved.name in ALWAYS_IGNORE_FILES:
-            return False
-        if resolved.suffix.lower() in ALWAYS_IGNORE_EXT:
-            return False
-
-        rel = rel_path.as_posix()
-        if self.smartignore_match(rel, is_dir=False):
-            return False
-        if self.gitignore_match(resolved, is_dir=False):
-            return False
-        return True
-
-
-def collect_files(root: Path, engine: IgnoreEngine) -> list[Path]:
-    files: list[Path] = []
-    visited: set[Path] = set()
-
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
-        current = Path(dirpath)
-        try:
-            current_real = current.resolve()
+            with os.scandir(current) as handle:
+                entries = list(handle)
         except OSError:
-            dirnames[:] = []
-            continue
-        if current_real in visited:
-            dirnames[:] = []
-            continue
-        visited.add(current_real)
-        try:
-            current_real.relative_to(root)
-        except ValueError:
-            dirnames[:] = []
             continue
 
-        dirnames[:] = [name for name in dirnames if engine.dir_allowed(current / name)]
-        for name in filenames:
-            candidate = current / name
-            if engine.file_allowed(candidate):
-                files.append(candidate.resolve())
+        relative_dir = current.relative_to(root).as_posix()
+        if relative_dir == ".":
+            relative_dir = ""
+        rules = inherited_rules + engine.local_rules(
+            current, relative_dir, {entry.name for entry in entries}
+        )
+        # Legacy code rechecks every parent after loading all ignore files.
+        # Check once per directory instead of once for each descendant file.
+        if relative_dir and engine.gitignore_match(
+            relative_dir, is_dir=True, rules=rules
+        ):
+            continue
 
-    files.sort(key=lambda p: p.relative_to(root).as_posix().lower())
+        for entry in entries:
+            name = entry.name
+            try:
+                is_dir = entry.is_dir(follow_symlinks=True)
+            except OSError:
+                continue
+            if is_dir:
+                if name in ALWAYS_IGNORE_DIRS:
+                    continue
+                try:
+                    directory = Path(entry.path).resolve()
+                    rel = directory.relative_to(root).as_posix()
+                except (OSError, ValueError, RuntimeError):
+                    continue
+                if directory in visited_dirs:
+                    continue
+                if engine.smartignore_match(rel, is_dir=True):
+                    continue
+                if engine.gitignore_match(rel, is_dir=True, rules=rules):
+                    continue
+                stack.append((directory, rules))
+                continue
+
+            if name in ALWAYS_IGNORE_FILES:
+                continue
+            if Path(name).suffix.lower() in ALWAYS_IGNORE_EXT:
+                continue
+            try:
+                if not entry.is_file(follow_symlinks=True):
+                    continue
+                # A normal DirEntry is already within this resolved directory.
+                # Only symlinks require additional canonicalization.
+                candidate = Path(entry.path).resolve() if entry.is_symlink() else current / name
+                relative = candidate.relative_to(root).as_posix()
+            except (OSError, ValueError, RuntimeError):
+                continue
+            if candidate.name in ALWAYS_IGNORE_FILES or candidate.suffix.lower() in ALWAYS_IGNORE_EXT:
+                continue
+            # The generated index owns this top-level archive path.
+            if relative == INDEX_NAME or relative in visited_files:
+                continue
+            if engine.smartignore_match(relative, is_dir=False):
+                continue
+            if engine.gitignore_match(relative, is_dir=False, rules=rules):
+                continue
+            files.append((candidate, relative))
+            visited_files.add(relative)
+
+    files.sort(key=lambda pair: pair[1].lower())
     return files
 
 
 def build_zip(root: Path, output: Path) -> Path:
+    """Build an atomic ZIP from the original files, without staging copies."""
+    root = root.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     temp = output.with_name(f".{output.name}.partial")
     try:
@@ -311,26 +303,19 @@ def build_zip(root: Path, output: Path) -> Path:
         pass
 
     engine = IgnoreEngine(root)
-    engine.load()
     files = collect_files(root, engine)
-
     try:
         with zipfile.ZipFile(
-            temp,
-            "w",
-            compression=zipfile.ZIP_DEFLATED,
-            compresslevel=2,
-            strict_timestamps=False,
+            temp, "w", compression=zipfile.ZIP_DEFLATED,
+            compresslevel=2, strict_timestamps=False,
         ) as archive:
-            relative_files = [source.relative_to(root).as_posix() for source in files]
-            for source, relative_path in zip(files, relative_files):
-                archive.write(source, arcname=relative_path)
-
+            for source, relative in files:
+                archive.write(source, arcname=relative)
             index_lines = [
-                "SmartSnap snapshot file index",
-                f"Files included: {len(relative_files)}",
+                "ZmartZnap snapshot file index",
+                f"Files included: {len(files)}",
                 "",
-                *relative_files,
+                *(relative for _source, relative in files),
                 "",
                 f"Index file: {INDEX_NAME}",
             ]
@@ -343,6 +328,12 @@ def build_zip(root: Path, output: Path) -> Path:
         except OSError:
             pass
         raise
+
+
+def snapshot_filename(root: Path, when: datetime | None = None) -> str:
+    """Local month, day, hour and minute; project folder used as ZIP prefix."""
+    timestamp = (when or datetime.now()).strftime("%m%d%H%M")
+    return f"znapshot_{root.name}_{timestamp}.zip"
 
 
 def state_root() -> Path:
@@ -554,7 +545,7 @@ def clipboard_sequence() -> int:
     return int(user32.GetClipboardSequenceNumber())
 
 
-def flash_status(text: str, title: str = "SmartSnap") -> None:
+def flash_status(text: str, title: str = "ZmartZnap") -> None:
     try:
         import tkinter as tk
 
@@ -606,14 +597,14 @@ def main() -> None:
 
     try:
         if os.name != "nt":
-            raise OSError("SmartSnap is Windows-only")
+            raise OSError("ZmartZnap is Windows-only")
 
         cleanup_stale_instances()
         root = Path(__file__).resolve().parent
         base = state_root()
         base.mkdir(parents=True, exist_ok=True)
         instance_dir = Path(tempfile.mkdtemp(prefix="snap_", dir=base))
-        zip_path = build_zip(root, instance_dir / OUTPUT_NAME)
+        zip_path = build_zip(root, instance_dir / snapshot_filename(root))
         marker = create_instance_marker(instance_dir, zip_path)
         sequence = copy_file_to_windows_clipboard(zip_path)
         status = "OK"
@@ -621,7 +612,7 @@ def main() -> None:
 
         # Hidden lifetime: the clipboard points to a physical file. Deleting it
         # immediately would make Ctrl+V fail. Delete it as soon as the clipboard
-        # is replaced, or let SmartSnapKill.pyw force cleanup.
+        # is replaced. Stale instances are cleaned up at the next launch.
         wait_until_clipboard_changes(sequence)
 
     except Exception:
